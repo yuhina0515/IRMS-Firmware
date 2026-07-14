@@ -1,440 +1,290 @@
+// ─────────────────────────────────────────────────────────────
+// IRMS 穿戴式感測節點(v3 重寫)
+// 架構依 ROADMAP 決策 D1(App-Driven):韌體只負責
+//   感測(50Hz 雙 MPU6050)→ 濾波(互補)→ 傳輸(BLE 25Hz)→ 執行 App 的 CMD
+// 達標/超限「判定」完全在 App 端 TriggerEngine,本檔不含判定邏輯。
+//
+// BLE 協定與 v2 完全相容:UUID、封包 T,S,K,TR,SR,KR / ERR:1、CMD 字串均不變。
+//
+// 任務配置:
+//   Task_Sensor (Core1, P3) 取樣+濾波+I2C 自復原
+//   Task_Comm   (Core0, P1) BLE 推播與重新廣播
+//   Task_LED    (Core1, P1) 狀態指示燈 + 達標雙響(旗標驅動)
+// ─────────────────────────────────────────────────────────────
 #include <Wire.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-#include <math.h>
+#include "config.h"
+#include "imu.h"
 
-const int addrThigh = 0x68;
-const int addrShin = 0x69;
-const int pinExtLED = 25; // Target Zone Visual Feedback
-const int pinBuzzer = 26;
-const int pinLED = 2; // Default ESP32 internal LED
-
-// System States for LED Indication
-enum SystemState {
-  STATE_INIT,
-  STATE_ERROR,
-  STATE_ADVERTISING,
-  STATE_CONNECTED,
-  STATE_GOAL_REACHED
-};
+// ── 系統狀態(僅供狀態燈與 ERR 推播;達標音另以旗標處理,不混入此處)──
+enum SystemState { STATE_INIT, STATE_ERROR, STATE_ADVERTISING, STATE_CONNECTED };
 volatile SystemState currentState = STATE_INIT;
 
-// I2C Pins for ESP32
-const int sdaPin = 21;
-const int sclPin = 22;
-
-// Sensor Data Structure
-struct SensorAngles {
-  float thigh;
-  float shin;
-  float knee;
-  float thighRoll;
-  float shinRoll;
-  float kneeRoll;
+// ── 共享角度資料 ──
+struct LegAngles {
+  float thigh, shin, knee;
+  float thighRoll, shinRoll, kneeRoll;
 };
-SensorAngles latestAngles = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-SemaphoreHandle_t xAngleMutex;
+static LegAngles latestAngles = {};
+static SemaphoreHandle_t xAngleMutex;
 
-// BLE Constants
-#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHAR_UUID_ANGLE_TX     "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define CHAR_UUID_PROFILE_RX   "beb5483f-36e1-4688-b7f5-ea07361b26a8"
-
-BLEServer* pServer = NULL;
-BLECharacteristic* pCharAngleTx = NULL;
-BLECharacteristic* pCharProfileRx = NULL;
+// ── BLE ──
+static BLEServer *pServer = nullptr;
+static BLECharacteristic *pCharAngleTx = nullptr;
+static BLECharacteristic *pCharProfileRx = nullptr;
 volatile bool deviceConnected = false;
 volatile bool oldDeviceConnected = false;
 
-// BLE Server Callbacks
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-      deviceConnected = true;
-      currentState = STATE_CONNECTED;
-      Serial.println("BLE Client Connected");
-    };
-    void onDisconnect(BLEServer* pServer) {
-      deviceConnected = false;
-      currentState = STATE_ADVERTISING;
-      Serial.println("BLE Client Disconnected");
-    }
+// ── 回饋輸出旗標(由 BLE onWrite 設定,由對應執行緒消費)──
+volatile bool goalBeepRequest = false;  // 達標雙響請求(Task_LED 消費)
+volatile bool alarmActive = false;      // 超限警報狀態(雙響結束後據此恢復蜂鳴器)
+
+// ── 感測物件 ──
+static Mpu6050 imuThigh(ADDR_THIGH);
+static Mpu6050 imuShin(ADDR_SHIN);
+static ComplementaryFilter filtThigh;
+static ComplementaryFilter filtShin;
+
+// ── 安全:關閉所有回饋輸出(斷線 / 開機時)──
+static void feedbackAllOff() {
+  digitalWrite(PIN_EXT_LED, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
+  alarmActive = false;
+  goalBeepRequest = false;
+}
+
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *) override {
+    deviceConnected = true;
+    if (currentState != STATE_ERROR) currentState = STATE_CONNECTED;
+    Serial.println("[BLE] client connected");
+  }
+  void onDisconnect(BLEServer *) override {
+    deviceConnected = false;
+    if (currentState != STATE_ERROR) currentState = STATE_ADVERTISING;
+    // 安全:App 已無法下指令,強制靜音熄燈,避免蜂鳴器卡在長鳴
+    feedbackAllOff();
+    Serial.println("[BLE] client disconnected — feedback outputs forced off");
+  }
 };
 
-class MyProfileCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-      String rxValue = pCharacteristic->getValue();
-      if (rxValue.length() > 0) {
-        String data = rxValue;
-        Serial.print("Received Command: ");
-        Serial.println(data);
-        
-        // App Command Channel Parser
-        if (data.startsWith("CMD:")) {
-          if (data == "CMD:GOAL") {
-            currentState = STATE_GOAL_REACHED;
-          } else if (data == "CMD:LED_ON") {
-            digitalWrite(pinExtLED, HIGH);
-          } else if (data == "CMD:LED_OFF") {
-            digitalWrite(pinExtLED, LOW);
-          } else if (data == "CMD:ALARM_ON") {
-            digitalWrite(pinBuzzer, HIGH);
-          } else if (data == "CMD:ALARM_OFF") {
-            digitalWrite(pinBuzzer, LOW);
-          }
-        }
-      }
+class ProfileCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *ch) override {
+    String data = ch->getValue();
+    if (data.length() == 0) return;
+    data.trim();  // 防禦:剝除 \r\n 空白,確保精確比對
+    Serial.print("[CMD] ");
+    Serial.println(data);
+
+    if (!data.startsWith("CMD:")) return;  // Profile 參數依 D1 不再解析
+    if (data == "CMD:GOAL") {
+      goalBeepRequest = true;
+    } else if (data == "CMD:LED_ON") {
+      digitalWrite(PIN_EXT_LED, HIGH);
+    } else if (data == "CMD:LED_OFF") {
+      digitalWrite(PIN_EXT_LED, LOW);
+    } else if (data == "CMD:ALARM_ON") {
+      alarmActive = true;
+      digitalWrite(PIN_BUZZER, HIGH);
+    } else if (data == "CMD:ALARM_OFF") {
+      alarmActive = false;
+      digitalWrite(PIN_BUZZER, LOW);
     }
+  }
 };
 
-bool setupMPU6050(int addr) {
-  Wire.beginTransmission(addr);
-  if (Wire.endTransmission(true) != 0) {
-    Serial.print("MPU Error: 0x");
-    Serial.println(addr, HEX);
-    return false;
-  }
-  
-  // 喚醒 MPU6050 (PWR_MGMT_1)
-  Wire.beginTransmission(addr);
-  Wire.write(0x6B);
-  Wire.write(0);    // Wake up
-  if (Wire.endTransmission(true) != 0) {
-    Serial.println("MPU Config Error: PWR_MGMT_1");
-    return false;
-  }
-  
-  // 設定陀螺儀量程 +/- 500 deg/s (GYRO_CONFIG)
-  Wire.beginTransmission(addr);
-  Wire.write(0x1B);
-  Wire.write(0x08);
-  if (Wire.endTransmission(true) != 0) {
-    Serial.println("MPU Config Error: GYRO_CONFIG");
-    return false;
-  }
-  
-  // 設定加速度計量程 +/- 4g (ACCEL_CONFIG)
-  Wire.beginTransmission(addr);
-  Wire.write(0x1C);
-  Wire.write(0x08);
-  if (Wire.endTransmission(true) != 0) {
-    Serial.println("MPU Config Error: ACCEL_CONFIG");
-    return false;
-  }
-  
-  return true;
-}
-
-bool readMPU6050(int addr, float &accelAngle, float &accelRoll, float &gyroRate, float &gyroRateRoll) {
-  Wire.beginTransmission(addr);
-  Wire.write(0x3B);
-  Wire.endTransmission(false);
-  uint8_t bytes = Wire.requestFrom(addr, 14, true);
-  
-  if (bytes != 14) return false;
-  
-  int16_t ax = Wire.read() << 8 | Wire.read();
-  int16_t ay = Wire.read() << 8 | Wire.read();
-  int16_t az = Wire.read() << 8 | Wire.read();
-  Wire.read(); Wire.read(); // Skip temp
-  int16_t gx = Wire.read() << 8 | Wire.read();
-  int16_t gy = Wire.read() << 8 | Wire.read();
-  int16_t gz = Wire.read() << 8 | Wire.read();
-
-  // Pitch (sagittal flexion)
-  accelAngle = atan2(ay, az) * 180.0 / PI;
-  gyroRate = gy / 65.5;
-
-  // Roll (coronal lateral bend)
-  accelRoll = atan2(ax, az) * 180.0 / PI;
-  gyroRateRoll = gx / 65.5;
-  return true;
-}
-
-float gyroOffsetThigh = 0, gyroOffsetThighRoll = 0;
-float gyroOffsetShin = 0, gyroOffsetShinRoll = 0;
-
-void calibrateMPU6050(int addr, float &gyroOffset, float &gyroOffsetRoll) {
-  Serial.print("Calibrating 0x"); Serial.println(addr, HEX);
-  float sumF = 0.0f;
-  float sumRollF = 0.0f;
-  int valid = 0;
-  for (int i = 0; i < 200; i++) {
-    float a, r, g, gr;
-    if (readMPU6050(addr, a, r, g, gr)) {
-      sumF += g;        // 直接累加 float 角速度，避免 float→long→float 精度損失
-      sumRollF += gr;
-      valid++;
-    }
-    vTaskDelay(pdMS_TO_TICKS(5));
-  }
-  if (valid > 0) {
-    gyroOffset = sumF / valid;
-    gyroOffsetRoll = sumRollF / valid;
-  }
-}
-
-// Tasks
-void Task_Sensor(void *pvParameters) {
-  (void) pvParameters;
-  bool ok1 = setupMPU6050(addrThigh);
-  bool ok2 = setupMPU6050(addrShin);
-
+// ─────────────────────────────────────────────────────────────
+// Task_Sensor:50Hz 取樣 → 互補濾波 → 發佈;I2C 失敗自動復原
+// ─────────────────────────────────────────────────────────────
+static void Task_Sensor(void *) {
+  const bool ok1 = imuThigh.begin();
+  const bool ok2 = imuShin.begin();
   if (!ok1 || !ok2) {
     currentState = STATE_ERROR;
-    Serial.println("CRITICAL: MPU6050 connection failed at startup!");
+    Serial.println("[IMU] CRITICAL: init failed at startup");
   }
 
-  calibrateMPU6050(addrThigh, gyroOffsetThigh, gyroOffsetThighRoll);
-  calibrateMPU6050(addrShin, gyroOffsetShin, gyroOffsetShinRoll);
+  // 校準與初始化(裝置未就緒時 calibrate/read 自動略過)
+  imuThigh.calibrate(CALIB_SAMPLES);
+  imuShin.calibrate(CALIB_SAMPLES);
+  ImuSample s1, s2;
+  if (imuThigh.read(s1)) filtThigh.reset(s1);
+  if (imuShin.read(s2)) filtShin.reset(s2);
 
-  float angleThigh = 0, angleThighRoll = 0;
-  float angleShin = 0, angleShinRoll = 0;
-  
-  // Read initial angles
-  float a1, r1, g1, gr1, a2, r2, g2, gr2;
-  if (readMPU6050(addrThigh, a1, r1, g1, gr1)) {
-    angleThigh = a1;
-    angleThighRoll = r1;
-  }
-  if (readMPU6050(addrShin, a2, r2, g2, gr2)) {
-    angleShin = a2;
-    angleShinRoll = r2;
-  }
+  uint32_t lastMs = millis();
+  int failCount = 0;
 
-  unsigned long lastTime = millis();
-  int i2cFailCount = 0;
-  
   for (;;) {
-    unsigned long currentTime = millis();
-    float dt = (currentTime - lastTime) / 1000.0;
-    lastTime = currentTime;
+    const uint32_t nowMs = millis();
+    const float dt = (nowMs - lastMs) / 1000.0f;  // 濾波器內部另有 DT_CLAMP_S 夾限
+    lastMs = nowMs;
 
-    float accAngleThigh, accRollThigh, gyroRateThigh, gyroRateRollThigh;
-    bool read1 = readMPU6050(addrThigh, accAngleThigh, accRollThigh, gyroRateThigh, gyroRateRollThigh);
-    
-    float accAngleShin, accRollShin, gyroRateShin, gyroRateRollShin;
-    bool read2 = readMPU6050(addrShin, accAngleShin, accRollShin, gyroRateShin, gyroRateRollShin);
+    const bool r1 = imuThigh.read(s1);
+    const bool r2 = imuShin.read(s2);
 
-    if (!read1 || !read2) {
-      i2cFailCount++;
-      if (i2cFailCount > 5) {
-        currentState = STATE_ERROR;
-        SensorAngles errData;
-        errData.thigh = -100.0;
-        errData.shin = -100.0;
-        errData.knee = -100.0;
-        errData.thighRoll = -100.0;
-        errData.shinRoll = -100.0;
-        errData.kneeRoll = -100.0;
-        
-        if (xSemaphoreTake(xAngleMutex, portMAX_DELAY) == pdTRUE) {
-          latestAngles = errData;
-          xSemaphoreGive(xAngleMutex);
-        }
-        
-        // Auto-recovery attempt
-        Wire.begin(sdaPin, sclPin);
-        Wire.setTimeOut(1000); // 復原後重新設定 I2C 超時
-        bool ok1 = setupMPU6050(addrThigh);
-        bool ok2 = setupMPU6050(addrShin);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        if (ok1 && ok2) {
-          float a1, r1, g1, gr1, a2, r2, g2, gr2;
-          if (readMPU6050(addrThigh, a1, r1, g1, gr1) && readMPU6050(addrShin, a2, r2, g2, gr2)) {
-            angleThigh = a1;
-            angleThighRoll = r1;
-            angleShin = a2;
-            angleShinRoll = r2;
-            i2cFailCount = 0;
-            currentState = deviceConnected ? STATE_CONNECTED : STATE_ADVERTISING;
-          }
-        }
-        lastTime = millis();
-        continue;
-      }
-    } else {
-      i2cFailCount = 0;
-      
-      gyroRateThigh -= gyroOffsetThigh;
-      angleThigh = 0.85 * (angleThigh + gyroRateThigh * dt) + 0.15 * accAngleThigh;
+    if (r1 && r2) {
+      failCount = 0;
+      filtThigh.update(s1, dt);
+      filtShin.update(s2, dt);
 
-      gyroRateRollThigh -= gyroOffsetThighRoll;
-      angleThighRoll = 0.85 * (angleThighRoll + gyroRateRollThigh * dt) + 0.15 * accRollThigh;
+      LegAngles a;
+      a.thigh     = filtThigh.pitch();
+      a.shin      = filtShin.pitch();
+      a.knee      = fabsf(a.thigh - a.shin);
+      a.thighRoll = filtThigh.roll();
+      a.shinRoll  = filtShin.roll();
+      a.kneeRoll  = fabsf(a.thighRoll - a.shinRoll);
 
-      gyroRateShin -= gyroOffsetShin;
-      angleShin = 0.85 * (angleShin + gyroRateShin * dt) + 0.15 * accAngleShin;
-
-      gyroRateRollShin -= gyroOffsetShinRoll;
-      angleShinRoll = 0.85 * (angleShinRoll + gyroRateRollShin * dt) + 0.15 * accRollShin;
-
-      float kneeAngle = fabs(angleThigh - angleShin);
-      float kneeAngleRoll = fabs(angleThighRoll - angleShinRoll);
-      
-      if (currentState == STATE_ERROR) {
-        currentState = deviceConnected ? STATE_CONNECTED : STATE_ADVERTISING; // 依據 BLE 連線狀態設定正確狀態
-      }
-      SensorAngles angles;
-      angles.thigh = angleThigh;
-      angles.shin = angleShin;
-      angles.knee = kneeAngle;
-      angles.thighRoll = angleThighRoll;
-      angles.shinRoll = angleShinRoll;
-      angles.kneeRoll = kneeAngleRoll;
-      
       if (xSemaphoreTake(xAngleMutex, portMAX_DELAY) == pdTRUE) {
-        latestAngles = angles;
+        latestAngles = a;
         xSemaphoreGive(xAngleMutex);
       }
+      if (currentState == STATE_ERROR) {
+        currentState = deviceConnected ? STATE_CONNECTED : STATE_ADVERTISING;
+        Serial.println("[IMU] recovered");
+      }
+    } else if (++failCount > I2C_FAIL_LIMIT) {
+      currentState = STATE_ERROR;
+      // 自動復原:重啟匯流排 → 重新初始化 → 穩定等待 → 以靜態角重設濾波
+      Wire.begin(PIN_SDA, PIN_SCL);
+      Wire.setTimeOut(I2C_TIMEOUT_MS);
+      const bool re1 = imuThigh.begin();
+      const bool re2 = imuShin.begin();
+      vTaskDelay(pdMS_TO_TICKS(RECOVER_WAIT_MS));
+      if (re1 && re2 && imuThigh.read(s1) && imuShin.read(s2)) {
+        filtThigh.reset(s1);
+        filtShin.reset(s2);
+        failCount = 0;
+      }
+      lastMs = millis();  // 復原耗時不得計入下一筆 dt
+      continue;
     }
-    
-    vTaskDelay(pdMS_TO_TICKS(20)); // 50Hz
+
+    vTaskDelay(pdMS_TO_TICKS(SENSOR_PERIOD_MS));
   }
 }
 
-void Task_Comm(void *pvParameters) {
-  (void) pvParameters;
-  SensorAngles currentData;
+// ─────────────────────────────────────────────────────────────
+// Task_Comm:25Hz 推播角度封包(或 ERR:1);斷線後重新廣播
+// ─────────────────────────────────────────────────────────────
+static void Task_Comm(void *) {
+  char buf[72];
   for (;;) {
     if (deviceConnected) {
-      // Read latest angles from the global variable using the mutex
-      bool hasData = false;
-      if (xSemaphoreTake(xAngleMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        currentData = latestAngles;
-        hasData = true;
-        xSemaphoreGive(xAngleMutex);
-      }
-      
-      if (hasData) {
-        String msg;
-        if (currentState == STATE_ERROR) {
-          msg = "ERR:1"; // I2C Disconnected
+      int len;
+      if (currentState == STATE_ERROR) {
+        len = snprintf(buf, sizeof(buf), "ERR:1");
+      } else {
+        LegAngles a;
+        if (xSemaphoreTake(xAngleMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          a = latestAngles;
+          xSemaphoreGive(xAngleMutex);
+          len = snprintf(buf, sizeof(buf), "T:%.1f,S:%.1f,K:%.1f,TR:%.1f,SR:%.1f,KR:%.1f",
+                         a.thigh, a.shin, a.knee, a.thighRoll, a.shinRoll, a.kneeRoll);
         } else {
-          // 使用 snprintf 避免 String 串接產生的堆積碎片化
-          char buf[72];
-          snprintf(buf, sizeof(buf), "T:%.1f,S:%.1f,K:%.1f,TR:%.1f,SR:%.1f,KR:%.1f",
-                   currentData.thigh, currentData.shin, currentData.knee,
-                   currentData.thighRoll, currentData.shinRoll, currentData.kneeRoll);
-          msg = buf;
+          len = 0;  // 本輪取不到資料,跳過
         }
-        pCharAngleTx->setValue((uint8_t*)msg.c_str(), msg.length());
+      }
+      if (len > 0) {
+        pCharAngleTx->setValue((uint8_t *)buf, len);
         pCharAngleTx->notify();
       }
     }
-    
-    // Handle disconnects
+
+    // 斷線 → 延遲後重新廣播
     if (!deviceConnected && oldDeviceConnected) {
-        vTaskDelay(pdMS_TO_TICKS(500)); 
-        pServer->startAdvertising();
-        Serial.println("Restarted Advertising");
-        oldDeviceConnected = deviceConnected;
+      vTaskDelay(pdMS_TO_TICKS(500));
+      pServer->startAdvertising();
+      Serial.println("[BLE] advertising restarted");
     }
-    if (deviceConnected && !oldDeviceConnected) {
-        oldDeviceConnected = deviceConnected;
-    }
-    
-    vTaskDelay(pdMS_TO_TICKS(40)); // Update BLE every 40ms (25Hz) for real-time feel
+    oldDeviceConnected = deviceConnected;
+
+    vTaskDelay(pdMS_TO_TICKS(COMM_PERIOD_MS));
   }
 }
 
-void Task_LED(void *pvParameters) {
-  (void) pvParameters;
-  pinMode(pinLED, OUTPUT);
+// ─────────────────────────────────────────────────────────────
+// Task_LED:狀態指示 + 達標雙響(旗標驅動,不動系統狀態)
+// ─────────────────────────────────────────────────────────────
+static void serveGoalBeep() {
+  // 雙短響 + 狀態燈雙閃,約 800ms;結束後蜂鳴器恢復 alarmActive 對應狀態
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    digitalWrite(PIN_STATUS_LED, LOW);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    digitalWrite(PIN_BUZZER, LOW);
+    digitalWrite(PIN_STATUS_LED, HIGH);
+    vTaskDelay(pdMS_TO_TICKS(i == 0 ? 150 : 250));
+  }
+  digitalWrite(PIN_BUZZER, alarmActive ? HIGH : LOW);
+}
+
+static void Task_LED(void *) {
+  pinMode(PIN_STATUS_LED, OUTPUT);
   for (;;) {
+    if (goalBeepRequest) {
+      goalBeepRequest = false;
+      serveGoalBeep();
+      continue;
+    }
     switch (currentState) {
-      case STATE_INIT:
-      case STATE_ADVERTISING:
-        // Slow Blink (Wait for connection)
-        digitalWrite(pinLED, !digitalRead(pinLED));
+      case STATE_CONNECTED:  // 恆亮
+        digitalWrite(PIN_STATUS_LED, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        break;
+      case STATE_ERROR:  // 快閃 10Hz
+        digitalWrite(PIN_STATUS_LED, !digitalRead(PIN_STATUS_LED));
+        vTaskDelay(pdMS_TO_TICKS(100));
+        break;
+      default:  // INIT / ADVERTISING:慢閃
+        digitalWrite(PIN_STATUS_LED, !digitalRead(PIN_STATUS_LED));
         vTaskDelay(pdMS_TO_TICKS(500));
         break;
-      case STATE_CONNECTED:
-        // Solid ON (Connected)
-        digitalWrite(pinLED, HIGH);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        break;
-      case STATE_ERROR:
-        // Fast Blink (Hardware Error)
-        digitalWrite(pinLED, !digitalRead(pinLED));
-        vTaskDelay(pdMS_TO_TICKS(100));
-        break;
-      case STATE_GOAL_REACHED:
-        // Rapid double blink on pinLED and double beep on pinBuzzer asynchronously
-        digitalWrite(pinLED, LOW);
-        digitalWrite(pinBuzzer, HIGH);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        
-        digitalWrite(pinBuzzer, LOW);
-        digitalWrite(pinLED, HIGH);
-        vTaskDelay(pdMS_TO_TICKS(150));
-        
-        digitalWrite(pinBuzzer, HIGH);
-        digitalWrite(pinLED, LOW);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        
-        digitalWrite(pinBuzzer, LOW);
-        digitalWrite(pinLED, HIGH);
-        vTaskDelay(pdMS_TO_TICKS(250)); // Total 800ms
-        
-        currentState = STATE_CONNECTED;
-        break;
-      default:
-        vTaskDelay(pdMS_TO_TICKS(100));
-        break;
     }
   }
 }
 
+// ─────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Wire.begin(sdaPin, sclPin);
-  Wire.setTimeOut(1000); // 設定 I2C 超時 1 秒，防止匯流排鎖死導致 Task_Sensor 卡死
-  
-  pinMode(pinExtLED, OUTPUT);
-  pinMode(pinBuzzer, OUTPUT); // Configure buzzer pin as digital output
-  digitalWrite(pinBuzzer, LOW); // Start silent
-  
-  // Startup Test Beep (200ms) for Active Buzzer
-  digitalWrite(pinBuzzer, HIGH);
-  delay(200);
-  digitalWrite(pinBuzzer, LOW);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setTimeOut(I2C_TIMEOUT_MS);
 
-  // RTOS Init
+  pinMode(PIN_EXT_LED, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  feedbackAllOff();
+
+  // 開機測試音(200ms)
+  digitalWrite(PIN_BUZZER, HIGH);
+  delay(200);
+  digitalWrite(PIN_BUZZER, LOW);
+
   xAngleMutex = xSemaphoreCreateMutex();
 
-  // BLE Setup
-  BLEDevice::init("IRMS_Device");
-  BLEDevice::setMTU(128); // 確保 6 軸數據包（最大 62 bytes）可完整傳送
+  BLEDevice::init(IRMS_DEVICE_NAME);
+  BLEDevice::setMTU(BLE_MTU);
   pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
+  pServer->setCallbacks(new ServerCallbacks());
 
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-
-  pCharAngleTx = pService->createCharacteristic(
-                      CHAR_UUID_ANGLE_TX,
-                      BLECharacteristic::PROPERTY_NOTIFY
-                    );
+  BLEService *service = pServer->createService(IRMS_SERVICE_UUID);
+  pCharAngleTx = service->createCharacteristic(IRMS_CHAR_ANGLE_TX, BLECharacteristic::PROPERTY_NOTIFY);
   pCharAngleTx->addDescriptor(new BLE2902());
+  pCharProfileRx = service->createCharacteristic(IRMS_CHAR_PROFILE_RX, BLECharacteristic::PROPERTY_WRITE);
+  pCharProfileRx->setCallbacks(new ProfileCallbacks());
 
-  pCharProfileRx = pService->createCharacteristic(
-                                         CHAR_UUID_PROFILE_RX,
-                                         BLECharacteristic::PROPERTY_WRITE
-                                       );
-  pCharProfileRx->setCallbacks(new MyProfileCallbacks());
-
-  pService->start();
+  service->start();
   pServer->getAdvertising()->start();
-  currentState = STATE_ADVERTISING; // 明確設定初始狀態為廣播模式
+  currentState = STATE_ADVERTISING;
   Serial.println("Waiting for BLE connection...");
 
-  // Start Tasks
-  xTaskCreatePinnedToCore(Task_Sensor, "Sensor", 4096, NULL, 3, NULL, 1);
-  xTaskCreatePinnedToCore(Task_Comm, "Comm", 4096, NULL, 1, NULL, 0); // Network tasks typically run on core 0
-  xTaskCreatePinnedToCore(Task_LED, "LED", 2048, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(Task_Sensor, "Sensor", 4096, nullptr, 3, nullptr, 1);
+  xTaskCreatePinnedToCore(Task_Comm, "Comm", 4096, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(Task_LED, "LED", 2048, nullptr, 1, nullptr, 1);
 }
 
 void loop() {
-  // FreeRTOS will manage tasks, loop is not used
-  vTaskDelay(portMAX_DELAY);
+  vTaskDelay(portMAX_DELAY);  // FreeRTOS 任務接管,loop 閒置
 }
