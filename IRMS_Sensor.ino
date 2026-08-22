@@ -69,6 +69,21 @@ class ServerCallbacks : public BLEServerCallbacks {
     feedbackAllOff();
     Serial.println("[BLE] client disconnected — feedback outputs forced off");
   }
+  // setMTU() 只是請求;真正生效的值由對端協商。App 端在 MTU 停在預設 23 時只會看到
+  // Roll 恆為 0(封包被切在 20 bytes),那是最難從症狀反推回成因的一種故障,
+  // 所以這裡把協商結果直接印出來,不留給人猜。
+  void onMtuChanged(BLEServer *, esp_ble_gatts_cb_param_t *param) override {
+    const uint16_t mtu = param->mtu.mtu;
+    Serial.print("[BLE] MTU negotiated: ");
+    Serial.print(mtu);
+    if (mtu < MTU_MIN_REQUIRED) {
+      Serial.print(" — TOO SMALL, need >= ");
+      Serial.print(MTU_MIN_REQUIRED);
+      Serial.println(" for the 6-axis packet; roll fields will be truncated");
+    } else {
+      Serial.println(" — OK for the 6-axis packet");
+    }
+  }
 };
 
 class ProfileCallbacks : public BLECharacteristicCallbacks {
@@ -173,7 +188,10 @@ static void Task_Sensor(void *) {
 static void Task_Comm(void *) {
   char buf[72];
   for (;;) {
-    if (deviceConnected) {
+    // 封包在「已連線」或「開了序列遙測」時才需要組。後者讓桌上旋轉記錄不必先有
+    // App 連線就能擷取(issue #2)——原本 notify 與封包組裝綁在同一個 if 裡,
+    // 導致唯一的資料出口是 BLE,而 BLE 正是那份記錄要拿來驗證的對象。
+    if (deviceConnected || SERIAL_TELEMETRY) {
       int len;
       if (currentState == STATE_ERROR) {
         len = snprintf(buf, sizeof(buf), "ERR:1");
@@ -189,8 +207,18 @@ static void Task_Comm(void *) {
         }
       }
       if (len > 0) {
-        pCharAngleTx->setValue((uint8_t *)buf, len);
-        pCharAngleTx->notify();
+        if (deviceConnected) {
+          pCharAngleTx->setValue((uint8_t *)buf, len);
+          pCharAngleTx->notify();
+        }
+        // 與 BLE 送出的完全同一個字串,前面補 millis() 時間戳(tab 分隔)。
+        // 送出的是組裝後的完整封包,不是 notify 之後被 MTU 切過的結果——
+        // 這正是要的:序列記錄代表感測器算出什麼,BLE 那端代表 App 收到什麼。
+        if (SERIAL_TELEMETRY) {
+          Serial.print(millis());
+          Serial.print('	');
+          Serial.println(buf);
+        }
       }
     }
 
