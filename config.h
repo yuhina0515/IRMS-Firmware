@@ -30,6 +30,25 @@ constexpr uint16_t BLE_MTU = 128;  // 6 軸封包最長約 62 bytes,預設 23 �
 constexpr uint16_t PACKET_MAX_BYTES = 54;
 constexpr uint16_t MTU_MIN_REQUIRED = PACKET_MAX_BYTES + 3;
 
+// ── OTA(2026-09-04,Phase B:BLE 韌體更新)──
+// 獨立的 service,刻意不掛在上面 IRMS_SERVICE_UUID 底下——現有感測 service 的
+// 兩個 characteristic 數量/用途是 App 既有的協定契約,OTA 走獨立 service 才能保證
+// 這次新增完全不動到那份契約一個位元。UUID 沿用同一組樣板只改最後幾碼,方便辨識同源。
+#define IRMS_OTA_SERVICE_UUID  "4fafc201-1fb5-459e-8fcc-c5c9c3319150"
+#define IRMS_CHAR_OTA_CONTROL  "beb5483e-36e1-4688-b7f5-ea07361b28a8"  // Write:OTA:START/END/ABORT
+#define IRMS_CHAR_OTA_DATA     "beb5483f-36e1-4688-b7f5-ea07361b28a8"  // Write No Response:韌體二進位分塊
+#define IRMS_CHAR_OTA_STATUS   "beb54840-36e1-4688-b7f5-ea07361b28a8"  // Notify:進度/結果
+#define IRMS_CHAR_FW_VERSION   "beb54841-36e1-4688-b7f5-ea07361b28a8"  // Read:目前已燒錄版本字串
+
+// 每次發新韌體都必須手動改這裡——App 端用這個字串跟裝置回報的版本比對,
+// 決定要不要提示更新(見 IRMS_App C2)。忘記改的後果是 App 誤判「已是最新」。
+#define IRMS_FW_VERSION "1.0.0"
+
+// OTA 資料分塊在收滿這個門檻才發一次進度 notify,不是每個 BLE write 都發——
+// 一般韌體 ~1MB、單塊 ~120 bytes 的話逐塊回報會是八千多次 notify,在同一顆晶片上
+// 跟 Task_Comm 的 25Hz 感測推播搶 Bluedroid 的傳輸資源沒有必要。
+constexpr size_t OTA_PROGRESS_STEP_BYTES = 4096;
+
 // ── 序列遙測(issue #2:桌上 ±180° 旋轉記錄)──
 // BLE notify 只在 App 連上時才送,所以「拿兩塊板子在桌上轉、把資料記下來」這件事
 // 原本做不到——必須先有 App 連線,而那正是要用這份記錄去驗證的東西。開啟後
