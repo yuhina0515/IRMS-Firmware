@@ -28,6 +28,8 @@ volatile SystemState currentState = STATE_INIT;
 struct LegAngles {
   float thigh, shin, knee;
   float thighRoll, shinRoll, kneeRoll;
+  float thighX, thighY, thighZ;
+  float shinX, shinY, shinZ;
 };
 static LegAngles latestAngles = {};
 static SemaphoreHandle_t xAngleMutex;
@@ -281,6 +283,8 @@ static void Task_Sensor(void *) {
       a.thighRoll = filtThigh.roll();
       a.shinRoll  = filtShin.roll();
       a.kneeRoll  = fabsf(a.thighRoll - a.shinRoll);
+      a.thighX = s1.ax; a.thighY = s1.ay; a.thighZ = s1.az;
+      a.shinX = s2.ax;  a.shinY = s2.ay;  a.shinZ = s2.az;
 
       if (xSemaphoreTake(xAngleMutex, portMAX_DELAY) == pdTRUE) {
         latestAngles = a;
@@ -315,7 +319,7 @@ static void Task_Sensor(void *) {
 // Task_Comm:25Hz 推播角度封包(或 ERR:1);斷線後重新廣播
 // ─────────────────────────────────────────────────────────────
 static void Task_Comm(void *) {
-  char buf[72];
+  char buf[128];
   for (;;) {
     // 封包在「已連線」或「開了序列遙測」時才需要組。後者讓桌上旋轉記錄不必先有
     // App 連線就能擷取(issue #2)——原本 notify 與封包組裝綁在同一個 if 裡,
@@ -329,8 +333,11 @@ static void Task_Comm(void *) {
         if (xSemaphoreTake(xAngleMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           a = latestAngles;
           xSemaphoreGive(xAngleMutex);
-          len = snprintf(buf, sizeof(buf), "T:%.1f,S:%.1f,K:%.1f,TR:%.1f,SR:%.1f,KR:%.1f",
-                         a.thigh, a.shin, a.knee, a.thighRoll, a.shinRoll, a.kneeRoll);
+          len = snprintf(buf, sizeof(buf),
+                         "T:%.1f,S:%.1f,K:%.1f,TR:%.1f,SR:%.1f,KR:%.1f,"
+                         "V:%.3f/%.3f/%.3f/%.3f/%.3f/%.3f",
+                         a.thigh, a.shin, a.knee, a.thighRoll, a.shinRoll, a.kneeRoll,
+                         a.thighX, a.thighY, a.thighZ, a.shinX, a.shinY, a.shinZ);
         } else {
           len = 0;  // 本輪取不到資料,跳過
         }

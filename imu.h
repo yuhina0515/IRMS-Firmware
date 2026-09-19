@@ -11,6 +11,7 @@
 
 /** 單次取樣:加速度計推得的角度 + 已扣零點偏移的角速度 */
 struct ImuSample {
+  float ax, ay, az;     // 正規化加速度向量(保留 atan2 前的資訊)
   float accPitch;       // 矢狀面角(deg,atan2(ay, az))
   float accRoll;        // 冠狀面角(deg,atan2(ax, az))
   float gyroPitchRate;  // 矢狀面角速度(deg/s)
@@ -52,6 +53,11 @@ public:
     const int16_t gy = (Wire.read() << 8) | Wire.read();
     Wire.read(); Wire.read();  // gz 不使用
 
+    const float norm = sqrtf((float)ax * ax + (float)ay * ay + (float)az * az);
+    if (norm < 1.0f) return false;
+    out.ax = ax / norm;
+    out.ay = ay / norm;
+    out.az = az / norm;
     out.accPitch      = atan2f((float)ay, (float)az) * 180.0f / PI;
     out.accRoll       = atan2f((float)ax, (float)az) * 180.0f / PI;
     // 軸向對應(2026-06-11 審計修正):Pitch 繞 Y 軸→gy、Roll 繞 X 軸→gx

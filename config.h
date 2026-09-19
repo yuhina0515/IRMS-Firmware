@@ -14,20 +14,22 @@ constexpr int PIN_BUZZER     = 26;  // 有源蜂鳴器(App CMD 直控)
 constexpr int PIN_STATUS_LED = 2;   // 內建狀態指示燈
 
 // ── IMU ──
-constexpr uint8_t ADDR_THIGH = 0x68;  // 大腿 MPU6050(AD0 → GND)
-constexpr uint8_t ADDR_SHIN  = 0x69;  // 小腿 MPU6050(AD0 → 3.3V)
+// 2026-09-15 真機逐顆晃動確認：含 ESP32、實際配戴於大腿的 IMU 是 0x69；
+// 外接、實際配戴於小腿的 IMU 是 0x68。先前註解與實際組裝相反，導致 T/S 全域顛倒。
+constexpr uint8_t ADDR_THIGH = 0x69;  // 大腿 MPU6050(含 ESP32，AD0 → 3.3V)
+constexpr uint8_t ADDR_SHIN  = 0x68;  // 小腿外接 MPU6050(AD0 → GND)
 
 // ── BLE 協定(與 App 契約,勿改)──
 #define IRMS_DEVICE_NAME      "IRMS_Device"
 #define IRMS_SERVICE_UUID     "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define IRMS_CHAR_ANGLE_TX    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define IRMS_CHAR_PROFILE_RX  "beb5483f-36e1-4688-b7f5-ea07361b26a8"
-constexpr uint16_t BLE_MTU = 128;  // 6 軸封包最長約 62 bytes,預設 23 會截斷
+constexpr uint16_t BLE_MTU = 128;  // 角度+正規化加速度封包最長 114 bytes
 
 // 6 軸封包滿刻度長度 "T:-180.0,S:-180.0,K:360.0,TR:-180.0,SR:-180.0,KR:360.0" = 54 bytes。
 // ATT notify 承載 = MTU − 3,故 MTU 至少要 57 才不會把 Roll 切掉。setMTU() 只是「請求」,
 // 真正生效的值由對端協商決定,所以韌體在 onMtuChanged 印出實際結果而不是假設它成功。
-constexpr uint16_t PACKET_MAX_BYTES = 54;
+constexpr uint16_t PACKET_MAX_BYTES = 114;
 constexpr uint16_t MTU_MIN_REQUIRED = PACKET_MAX_BYTES + 3;
 
 // ── OTA(2026-09-04,Phase B:BLE 韌體更新)──
