@@ -11,7 +11,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Tag must match IRMS_FW_VERSION
         run: |
-          fw=$(sed -n 's/^#define IRMS_FW_VERSION "\(.*\)"/\1/p' IRMS_Sensor/config.h | tr -d '')
+          # config.h uses CRLF line endings; strip CR before comparing.
+          fw=$(sed -n 's/^#define IRMS_FW_VERSION "\(.*\)"/\1/p' IRMS_Sensor/config.h | tr -d '\r')
           tag="${GITHUB_REF_NAME#v}"
           echo "config.h=$fw tag=$tag"
           # The app compares this string with what the device reports; a mismatch would make
@@ -26,6 +27,8 @@ jobs:
           FIRMWARE_SIGNING_KEY: ${{ secrets.FIRMWARE_SIGNING_KEY }}
           MIN_APP_VERSION: ${{ vars.MIN_APP_VERSION }}
         run: |
+          # actions/checkout leaves a lightweight ref; fetch the annotated tag to read its message.
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
           git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > notes.txt
           node scripts/make-manifest.mjs build/IRMS_Sensor.bin "${GITHUB_REF_NAME#v}" build notes.txt
       - name: Publish
