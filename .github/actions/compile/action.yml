@@ -1,0 +1,20 @@
+name: compile
+description: Compile IRMS_Sensor with the pinned ESP32 Arduino core
+outputs:
+  bin:
+    description: Path of the compiled application image
+    value: build/IRMS_Sensor.bin
+runs:
+  using: composite
+  steps:
+    - uses: arduino/setup-arduino-cli@v2
+    - shell: bash
+      run: |
+        arduino-cli config init --overwrite
+        arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+        arduino-cli core update-index
+        # Pinned: the project targets ESP32 Arduino Core 3.0.x (doc/README.md). Bump deliberately.
+        arduino-cli core install esp32:esp32@3.0.7
+        # Default partition scheme already has ota_0/ota_1 (see IRMS doc/OPTIMIZATION.md OTA notes).
+        arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir build IRMS_Sensor
+        ls -l build

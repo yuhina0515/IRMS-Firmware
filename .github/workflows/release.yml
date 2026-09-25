@@ -1,0 +1,36 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match IRMS_FW_VERSION
+        run: |
+          fw=$(sed -n 's/^#define IRMS_FW_VERSION "\(.*\)"/\1/p' IRMS_Sensor/config.h)
+          tag="${GITHUB_REF_NAME#v}"
+          echo "config.h=$fw tag=$tag"
+          # The app compares this string with what the device reports; a mismatch would make
+          # every device look outdated forever (or never).
+          test "$fw" = "$tag"
+      - uses: ./.github/actions/compile
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Manifest + signature
+        env:
+          FIRMWARE_SIGNING_KEY: ${{ secrets.FIRMWARE_SIGNING_KEY }}
+          MIN_APP_VERSION: ${{ vars.MIN_APP_VERSION }}
+        run: |
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > notes.txt
+          node scripts/make-manifest.mjs build/IRMS_Sensor.bin "${GITHUB_REF_NAME#v}" build notes.txt
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.txt \
+            build/IRMS_Sensor.bin build/manifest.json build/manifest.json.sig
