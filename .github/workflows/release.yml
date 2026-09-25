@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Tag must match IRMS_FW_VERSION
         run: |
-          fw=$(sed -n 's/^#define IRMS_FW_VERSION "\(.*\)"/\1/p' IRMS_Sensor/config.h)
+          fw=$(sed -n 's/^#define IRMS_FW_VERSION "\(.*\)"/\1/p' IRMS_Sensor/config.h | tr -d '')
           tag="${GITHUB_REF_NAME#v}"
           echo "config.h=$fw tag=$tag"
           # The app compares this string with what the device reports; a mismatch would make
