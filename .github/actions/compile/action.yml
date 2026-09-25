@@ -17,4 +17,6 @@ runs:
         arduino-cli core install esp32:esp32@3.0.7
         # Default partition scheme already has ota_0/ota_1 (see IRMS doc/OPTIMIZATION.md OTA notes).
         arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir build IRMS_Sensor
+        # arduino-cli names the app image <sketch>.ino.bin; publish it under a stable name.
+        cp build/IRMS_Sensor.ino.bin build/IRMS_Sensor.bin
         ls -l build
