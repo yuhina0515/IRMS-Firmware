@@ -44,7 +44,7 @@ constexpr uint16_t MTU_MIN_REQUIRED = PACKET_MAX_BYTES + 3;
 
 // 每次發新韌體都必須手動改這裡——App 端用這個字串跟裝置回報的版本比對,
 // 決定要不要提示更新(見 IRMS_App C2)。忘記改的後果是 App 誤判「已是最新」。
-#define IRMS_FW_VERSION "1.0.0"
+#define IRMS_FW_VERSION "1.0.1-beta.1"
 
 // OTA 資料分塊在收滿這個門檻才發一次進度 notify,不是每個 BLE write 都發——
 // 一般韌體 ~1MB、單塊 ~120 bytes 的話逐塊回報會是八千多次 notify,在同一顆晶片上
