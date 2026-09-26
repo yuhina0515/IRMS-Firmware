@@ -35,5 +35,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.txt \
-            build/IRMS_Sensor.bin build/manifest.json build/manifest.json.sig
+          # vX.Y.Z-anything is a beta: published as a GitHub prerelease, so the stable channel
+          # (releases/latest) never sees it.
+          pre=""
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.txt $pre             build/IRMS_Sensor.bin build/manifest.json build/manifest.json.sig
+          # The beta channel reads the fixed beta-latest pointer; every tag (beta or stable)
+          # refreshes it, so beta users also move on to a newer stable release.
+          gh release view beta-latest >/dev/null 2>&1 || gh release create beta-latest --prerelease             --title "beta-latest (pointer)" --notes "Machine-read pointer for the IRMS app beta firmware channel. Download firmware from the versioned releases."
+          gh release upload beta-latest build/manifest.json build/manifest.json.sig --clobber

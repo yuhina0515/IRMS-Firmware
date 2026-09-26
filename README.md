@@ -17,8 +17,12 @@ so that firmware releases reach devices automatically.
    hashes, and pushes the update over BLE OTA **only when idle** (no session, no hardware
    error). A running session defers the update until it ends.
 
-Pre-releases are not picked up (`releases/latest` skips them), so a tag can be tested by
-marking its release as a pre-release first.
+## Channels
+
+Same rule as the app's own updates, following the app's 「接收 Beta 版更新」 setting:
+
+- **Stable**: tag `vX.Y.Z` (and `IRMS_FW_VERSION` `X.Y.Z`). Apps on the stable channel read `releases/latest`.
+- **Beta**: tag `vX.Y.Z-beta.N` (and `IRMS_FW_VERSION` `X.Y.Z-beta.N`). Published as a GitHub prerelease; apps on the beta channel read the `beta-latest` pointer release, which every tag refreshes. A stable-channel app refuses a pre-release manifest even if it is served to it.
 
 ## Keys
 
