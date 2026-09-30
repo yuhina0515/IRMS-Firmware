@@ -1,0 +1,32 @@
+IRMS Source-Available License (DRAFT - pending legal review)
+
+Copyright (c) 2026 IRMS Team. All rights reserved.
+
+This license applies to all source code, firmware, documentation and other
+materials in this repository.
+
+1. Permitted use. You may read and study the source code, and run unmodified
+   official releases for personal, non-commercial purposes.
+
+2. Not permitted without prior written permission from IRMS Team: copying,
+   modifying, redistributing or sublicensing the post-beta.19 material;
+   commercial use; building derivative works or products; using it to
+   train or evaluate machine-learning models; removing this notice.
+
+3. No patent license. Nothing in this license grants, expressly or by
+   implication, estoppel or otherwise, any license under any patent, patent
+   application or other patent right owned or controlled by IRMS Team,
+   including rights needed to make, use, sell or import any apparatus or
+   method embodied in the materials. All such rights are reserved.
+
+4. Contributions. Contributions are accepted only under a separate written
+   agreement with IRMS Team that assigns or licenses them to IRMS Team,
+   including patent rights.
+
+5. No warranty. The materials are provided "AS IS", without warranty of any
+   kind. IRMS is a research prototype and not a certified medical device;
+   IRMS Team is not liable for any damages arising from its use.
+
+6. Termination. Any breach ends your rights under this license automatically.
+
+Contact: open an issue at https://github.com/yuhina0515/IRMS for permission requests.

@@ -1,0 +1,431 @@
+#include <Wire.h>
+#include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <math.h>
+
+const int addrThigh = 0x68;
+const int addrShin = 0x69;
+const int pinExtLED = 25; // Target Zone Visual Feedback
+const int pinBuzzer = 26;
+const int pinLED = 2; // Default ESP32 internal LED, or external LED pin
+
+// System States for LED Indication
+enum SystemState {
+  STATE_INIT,
+  STATE_ERROR,
+  STATE_ADVERTISING,
+  STATE_CONNECTED,
+  STATE_GOAL_REACHED
+};
+volatile SystemState currentState = STATE_INIT;
+
+// I2C Pins for ESP32
+const int sdaPin = 21;
+const int sclPin = 22;
+
+// RTOS Handles
+QueueHandle_t xQueueAngle;
+SemaphoreHandle_t xProfileMutex;
+
+// Profile Structure
+struct RehabilitationProfile {
+  float targetAngle;
+  float tolerance;
+  int holdTimeMs;
+};
+RehabilitationProfile currentProfile;
+Preferences preferences;
+
+// Sensor Data Structure
+struct SensorAngles {
+  float thigh;
+  float shin;
+  float knee;
+};
+
+// BLE Constants
+#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHAR_UUID_ANGLE_TX     "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define CHAR_UUID_PROFILE_RX   "beb5483f-36e1-4688-b7f5-ea07361b26a8"
+
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharAngleTx = NULL;
+BLECharacteristic* pCharProfileRx = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+// BLE Server Callbacks
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      currentState = STATE_CONNECTED;
+      Serial.println("BLE Client Connected");
+    };
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      currentState = STATE_ADVERTISING;
+      Serial.println("BLE Client Disconnected");
+    }
+};
+
+class MyProfileCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String rxValue = pCharacteristic->getValue();
+      if (rxValue.length() > 0) {
+        String data = rxValue;
+        Serial.print("Received Profile Data: ");
+        Serial.println(data);
+        // Expected format: "targetAngle,tolerance,holdTimeMs"
+        // Example: "90.0,10.0,5000"
+        int firstComma = data.indexOf(',');
+        int secondComma = data.indexOf(',', firstComma + 1);
+        if (firstComma > 0 && secondComma > 0) {
+          float tAngle = data.substring(0, firstComma).toFloat();
+          float tol = data.substring(firstComma + 1, secondComma).toFloat();
+          int hTime = data.substring(secondComma + 1).toInt();
+          
+          if(xSemaphoreTake(xProfileMutex, portMAX_DELAY) == pdTRUE) {
+            currentProfile.targetAngle = tAngle;
+            currentProfile.tolerance = tol;
+            currentProfile.holdTimeMs = hTime;
+            xSemaphoreGive(xProfileMutex);
+            
+            // Save to NVS
+            preferences.begin("irms", false);
+            preferences.putFloat("target", currentProfile.targetAngle);
+            preferences.putFloat("tol", currentProfile.tolerance);
+            preferences.putInt("hold", currentProfile.holdTimeMs);
+            preferences.end();
+            Serial.println("Profile Updated & Saved!");
+          }
+        }
+      }
+    }
+};
+
+bool setupMPU6050(int addr) {
+  Wire.beginTransmission(addr);
+  if (Wire.endTransmission(true) != 0) {
+    Serial.print("MPU Error: 0x");
+    Serial.println(addr, HEX);
+    return false;
+  }
+  
+  Wire.beginTransmission(addr);
+  Wire.write(0x6B); // PWR_MGMT_1
+  Wire.write(0);    // Wake up
+  Wire.endTransmission(true);
+  
+  // Set Gyro config to +/- 500 deg/s
+  Wire.beginTransmission(addr);
+  Wire.write(0x1B);
+  Wire.write(0x08);
+  Wire.endTransmission(true);
+  
+  // Set Accel config to +/- 4g
+  Wire.beginTransmission(addr);
+  Wire.write(0x1C);
+  Wire.write(0x08);
+  Wire.endTransmission(true);
+  
+  return true;
+}
+
+bool readMPU6050(int addr, float &accelAngle, float &gyroRate) {
+  Wire.beginTransmission(addr);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  uint8_t bytes = Wire.requestFrom(addr, 14, true);
+  
+  if (bytes != 14) return false;
+  
+  int16_t ax = Wire.read() << 8 | Wire.read();
+  int16_t ay = Wire.read() << 8 | Wire.read();
+  int16_t az = Wire.read() << 8 | Wire.read();
+  Wire.read(); Wire.read(); // Skip temp
+  int16_t gx = Wire.read() << 8 | Wire.read();
+  int16_t gy = Wire.read() << 8 | Wire.read();
+  int16_t gz = Wire.read() << 8 | Wire.read();
+
+  accelAngle = atan2(ay, az) * 180.0 / PI;
+  gyroRate = gx / 65.5;
+  return true;
+}
+
+float gyroOffsetThigh = 0;
+float gyroOffsetShin = 0;
+
+void calibrateMPU6050(int addr, float &gyroOffset) {
+  Serial.print("Calibrating 0x"); Serial.println(addr, HEX);
+  long sum = 0;
+  int valid = 0;
+  for (int i = 0; i < 200; i++) {
+    float a, g;
+    if (readMPU6050(addr, a, g)) {
+      sum += (g * 65.5);
+      valid++;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  if (valid > 0) gyroOffset = (float)sum / valid / 65.5;
+}
+
+// Tasks
+void Task_Sensor(void *pvParameters) {
+  (void) pvParameters;
+  bool ok1 = setupMPU6050(addrThigh);
+  bool ok2 = setupMPU6050(addrShin);
+
+  if (!ok1 || !ok2) {
+    currentState = STATE_ERROR;
+    Serial.println("CRITICAL: MPU6050 connection failed at startup!");
+  }
+
+  calibrateMPU6050(addrThigh, gyroOffsetThigh);
+  calibrateMPU6050(addrShin, gyroOffsetShin);
+
+  float angleThigh = 0, angleShin = 0;
+  
+  // Read initial angles
+  float a1, g1, a2, g2;
+  if (readMPU6050(addrThigh, a1, g1)) angleThigh = a1;
+  if (readMPU6050(addrShin, a2, g2)) angleShin = a2;
+
+  unsigned long lastTime = millis();
+  int i2cFailCount = 0;
+  
+  for (;;) {
+    unsigned long currentTime = millis();
+    float dt = (currentTime - lastTime) / 1000.0;
+    lastTime = currentTime;
+
+    float accAngleThigh, gyroRateThigh;
+    bool read1 = readMPU6050(addrThigh, accAngleThigh, gyroRateThigh);
+    
+    float accAngleShin, gyroRateShin;
+    bool read2 = readMPU6050(addrShin, accAngleShin, gyroRateShin);
+
+    if (!read1 || !read2) {
+      i2cFailCount++;
+      if (i2cFailCount > 5) {
+        currentState = STATE_ERROR;
+        SensorAngles errData;
+        errData.thigh = -100.0;
+        errData.shin = -100.0;
+        errData.knee = -100.0;
+        xQueueOverwrite(xQueueAngle, &errData);
+        
+        // Auto-recovery attempt
+        Wire.begin(sdaPin, sclPin);
+        setupMPU6050(addrThigh);
+        setupMPU6050(addrShin);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        continue;
+      }
+    } else {
+      i2cFailCount = 0;
+      
+      gyroRateThigh -= gyroOffsetThigh;
+      angleThigh = 0.98 * (angleThigh + gyroRateThigh * dt) + 0.02 * accAngleThigh;
+
+      gyroRateShin -= gyroOffsetShin;
+      angleShin = 0.98 * (angleShin + gyroRateShin * dt) + 0.02 * accAngleShin;
+
+      float kneeAngle = fabs(angleThigh - angleShin);
+      
+      if (currentState == STATE_ERROR) {
+        currentState = STATE_CONNECTED; // Recovered automatically
+      }
+      SensorAngles angles;
+      angles.thigh = angleThigh;
+      angles.shin = angleShin;
+      angles.knee = kneeAngle;
+      xQueueOverwrite(xQueueAngle, &angles);
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(20)); // 50Hz
+  }
+}
+
+void Task_Logic(void *pvParameters) {
+  (void) pvParameters;
+  SensorAngles currentData;
+  unsigned long inZoneStartTime = 0;
+  bool isGoalReached = false;
+  
+  for (;;) {
+    if (xQueueReceive(xQueueAngle, &currentData, portMAX_DELAY) == pdPASS) {
+      float kneeAngle = currentData.knee;
+      RehabilitationProfile localProfile;
+      if(xSemaphoreTake(xProfileMutex, portMAX_DELAY) == pdTRUE) {
+        localProfile = currentProfile;
+        xSemaphoreGive(xProfileMutex);
+      }
+      
+      float diff = fabs(kneeAngle - localProfile.targetAngle);
+      
+      if (diff <= localProfile.tolerance) {
+        // Inside tolerance zone
+        digitalWrite(pinExtLED, HIGH); // Visual feedback: ON
+        
+        if (inZoneStartTime == 0) {
+          inZoneStartTime = millis();
+        } else {
+          if (!isGoalReached && (millis() - inZoneStartTime >= localProfile.holdTimeMs)) {
+            isGoalReached = true;
+            currentState = STATE_GOAL_REACHED;
+            Serial.println("Goal Reached! Hold time completed.");
+            // Short double beep using PWM
+            ledcWrite(pinBuzzer, 128); vTaskDelay(pdMS_TO_TICKS(100)); // 50% duty
+            ledcWrite(pinBuzzer, 0);   vTaskDelay(pdMS_TO_TICKS(100));
+            ledcWrite(pinBuzzer, 128); vTaskDelay(pdMS_TO_TICKS(100));
+            ledcWrite(pinBuzzer, 0);
+          }
+        }
+      } else {
+        // Outside tolerance zone
+        digitalWrite(pinExtLED, LOW); // Visual feedback: OFF
+        inZoneStartTime = 0;
+        isGoalReached = false;
+        
+        // If angle is wildly out of bounds (over-extension), trigger alarm
+        if (kneeAngle > localProfile.targetAngle + localProfile.tolerance + 10.0) {
+          ledcWrite(pinBuzzer, 128); // Continuous beep
+        } else {
+          ledcWrite(pinBuzzer, 0);   // Silence
+        }
+      }
+    }
+  }
+}
+
+void Task_Comm(void *pvParameters) {
+  (void) pvParameters;
+  SensorAngles currentData;
+  for (;;) {
+    if (deviceConnected) {
+      // Peek at the latest angle
+      if (xQueuePeek(xQueueAngle, &currentData, 0) == pdPASS) {
+        String msg;
+        if (currentState == STATE_ERROR) {
+          msg = "ERR:1"; // I2C Disconnected
+        } else {
+          msg = "T:" + String(currentData.thigh, 1) + ",S:" + String(currentData.shin, 1) + ",K:" + String(currentData.knee, 1);
+        }
+        pCharAngleTx->setValue((uint8_t*)msg.c_str(), msg.length());
+        pCharAngleTx->notify();
+      }
+    }
+    
+    // Handle disconnects
+    if (!deviceConnected && oldDeviceConnected) {
+        vTaskDelay(pdMS_TO_TICKS(500)); 
+        pServer->startAdvertising();
+        Serial.println("Restarted Advertising");
+        oldDeviceConnected = deviceConnected;
+    }
+    if (deviceConnected && !oldDeviceConnected) {
+        oldDeviceConnected = deviceConnected;
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(100)); // Update BLE every 100ms (10Hz)
+  }
+}
+
+void Task_LED(void *pvParameters) {
+  (void) pvParameters;
+  pinMode(pinLED, OUTPUT);
+  for (;;) {
+    switch (currentState) {
+      case STATE_INIT:
+      case STATE_ADVERTISING:
+        // Slow Blink (Wait for connection)
+        digitalWrite(pinLED, !digitalRead(pinLED));
+        vTaskDelay(pdMS_TO_TICKS(500));
+        break;
+      case STATE_CONNECTED:
+        // Solid ON (Connected)
+        digitalWrite(pinLED, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        break;
+      case STATE_ERROR:
+        // Fast Blink (Hardware Error)
+        digitalWrite(pinLED, !digitalRead(pinLED));
+        vTaskDelay(pdMS_TO_TICKS(100));
+        break;
+      case STATE_GOAL_REACHED:
+        // Rapid double blink then back to connected
+        digitalWrite(pinLED, LOW); vTaskDelay(pdMS_TO_TICKS(100));
+        digitalWrite(pinLED, HIGH); vTaskDelay(pdMS_TO_TICKS(100));
+        digitalWrite(pinLED, LOW); vTaskDelay(pdMS_TO_TICKS(100));
+        digitalWrite(pinLED, HIGH); vTaskDelay(pdMS_TO_TICKS(500));
+        currentState = STATE_CONNECTED;
+        break;
+      default:
+        vTaskDelay(pdMS_TO_TICKS(100));
+        break;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(sdaPin, sclPin);
+  
+  pinMode(pinExtLED, OUTPUT);
+  // Setup PWM for Buzzer (ESP32 Core 3.0 API: 2000Hz, 8-bit resolution)
+  ledcAttach(pinBuzzer, 2000, 8);
+  ledcWrite(pinBuzzer, 0); // Start silent
+
+  // Initialize NVS and load profile
+  preferences.begin("irms", false);
+  currentProfile.targetAngle = preferences.getFloat("target", 90.0);
+  currentProfile.tolerance = preferences.getFloat("tol", 10.0);
+  currentProfile.holdTimeMs = preferences.getInt("hold", 3000);
+  preferences.end();
+  
+  Serial.print("Loaded Profile - Target: "); Serial.print(currentProfile.targetAngle);
+  Serial.print(" Tol: "); Serial.print(currentProfile.tolerance);
+  Serial.print(" Hold(ms): "); Serial.println(currentProfile.holdTimeMs);
+
+  // RTOS Init
+  xQueueAngle = xQueueCreate(1, sizeof(SensorAngles)); // Only need latest angle (queue size 1)
+  xProfileMutex = xSemaphoreCreateMutex();
+
+  // BLE Setup
+  BLEDevice::init("IRMS_Device");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharAngleTx = pService->createCharacteristic(
+                      CHAR_UUID_ANGLE_TX,
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+  pCharAngleTx->addDescriptor(new BLE2902());
+
+  pCharProfileRx = pService->createCharacteristic(
+                                         CHAR_UUID_PROFILE_RX,
+                                         BLECharacteristic::PROPERTY_WRITE
+                                       );
+  pCharProfileRx->setCallbacks(new MyProfileCallbacks());
+
+  pService->start();
+  pServer->getAdvertising()->start();
+  Serial.println("Waiting for BLE connection...");
+
+  // Start Tasks
+  xTaskCreatePinnedToCore(Task_Sensor, "Sensor", 4096, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(Task_Logic, "Logic", 2048, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(Task_Comm, "Comm", 4096, NULL, 1, NULL, 0); // Network tasks typically run on core 0
+  xTaskCreatePinnedToCore(Task_LED, "LED", 1024, NULL, 1, NULL, 1);
+}
+
+void loop() {
+  // FreeRTOS will manage tasks, loop is not used
+  vTaskDelay(portMAX_DELAY);
+}
