@@ -346,7 +346,7 @@ static void Task_Comm(void *) {
         if (xSemaphoreTake(xAngleMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           a = latestAngles;
           xSemaphoreGive(xAngleMutex);
-          if (rawStreamOn && deviceConnected) {
+          if (rawStreamOn && deviceConnected && otaState != OTA_RECEIVING) {
             const int rawLen = snprintf(rawBuf, sizeof(rawBuf),
                                         "G:%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.3f/%.3f/%.3f/%.3f/%.3f/%.3f",
                                         a.thighGyro[0], a.thighGyro[1], a.thighGyro[2],
