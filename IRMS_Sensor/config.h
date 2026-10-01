@@ -44,7 +44,7 @@ constexpr uint16_t MTU_MIN_REQUIRED = PACKET_MAX_BYTES + 3;
 
 // 每次發新韌體都必須手動改這裡——App 端用這個字串跟裝置回報的版本比對,
 // 決定要不要提示更新(見 IRMS_App C2)。忘記改的後果是 App 誤判「已是最新」。
-#define IRMS_FW_VERSION "1.0.1-beta.1"
+#define IRMS_FW_VERSION "1.0.1-beta.2"
 
 // OTA 資料分塊在收滿這個門檻才發一次進度 notify,不是每個 BLE write 都發——
 // 一般韌體 ~1MB、單塊 ~120 bytes 的話逐塊回報會是八千多次 notify,在同一顆晶片上
@@ -67,6 +67,15 @@ constexpr size_t OTA_PROGRESS_STEP_BYTES = 4096;
 // ≈ 16 kbps,佔用可忽略。
 constexpr bool SERIAL_TELEMETRY = true;
 
+// ── 原始資料串流(2026-10-01,校正模組 B)──
+// 預設關閉,App 送 CMD:RAW_ON 才開(CMD:RAW_OFF 或斷線即關)。舊版 App 的解析器遇到
+// 未知封包會判為 malformed,所以絕不能在對方沒要求時主動送。封包與角度封包分開送,
+// 既有 T,S,K,TR,SR,KR,V: 封包一個位元都不動:
+//   G:tgx/tgy/tgz/sgx/sgy/sgz/tax/tay/taz/sax/say/saz
+// 前六個是已扣零點的陀螺儀角速度(deg/s,感測器軸向,含 gz),後六個是未正規化的加速度(g)。
+// 最長約 86 bytes,小於 MTU 128 的 125 bytes 承載。
+constexpr size_t RAW_PACKET_MAX_BYTES = 112;
+
 // ── 時序 ──
 constexpr uint32_t SENSOR_PERIOD_MS = 20;    // 感測迴圈 50Hz
 constexpr uint32_t COMM_PERIOD_MS   = 40;    // BLE 推播 25Hz
@@ -76,6 +85,7 @@ constexpr uint32_t RECOVER_WAIT_MS  = 1000;  // I2C 復原後的穩定等待
 // ── 濾波與校準 ──
 constexpr float FILTER_ALPHA   = 0.85f;  // 互補濾波:陀螺儀積分權重
 constexpr float GYRO_LSB_500   = 65.5f;  // ±500 dps 靈敏度 (LSB/dps)
+constexpr float ACCEL_LSB_4G   = 8192.0f; // ±4 g 靈敏度 (LSB/g)
 constexpr int   CALIB_SAMPLES  = 200;    // 開機零點校準取樣數
 constexpr float DT_CLAMP_S     = 0.2f;   // dt 上限:任何停頓後防積分尖峰
 constexpr int   I2C_FAIL_LIMIT = 5;      // 連續讀取失敗即進入錯誤/復原流程

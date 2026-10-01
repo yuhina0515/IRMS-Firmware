@@ -16,6 +16,8 @@ struct ImuSample {
   float accRoll;        // 冠狀面角(deg,atan2(ax, az))
   float gyroPitchRate;  // 矢狀面角速度(deg/s)
   float gyroRollRate;   // 冠狀面角速度(deg/s)
+  float gyroYawRate;    // 繞 Z 軸角速度(deg/s,已扣零點;僅原始串流使用)
+  float rawAx, rawAy, rawAz;  // 未正規化加速度(g;僅原始串流使用)
 };
 
 class Mpu6050 {
@@ -51,7 +53,7 @@ public:
     Wire.read(); Wire.read();  // 溫度,略過
     const int16_t gx = (Wire.read() << 8) | Wire.read();
     const int16_t gy = (Wire.read() << 8) | Wire.read();
-    Wire.read(); Wire.read();  // gz 不使用
+    const int16_t gz = (Wire.read() << 8) | Wire.read();
 
     const float norm = sqrtf((float)ax * ax + (float)ay * ay + (float)az * az);
     if (norm < 1.0f) return false;
@@ -63,6 +65,10 @@ public:
     // 軸向對應(2026-06-11 審計修正):Pitch 繞 Y 軸→gy、Roll 繞 X 軸→gx
     out.gyroPitchRate = (float)gy / GYRO_LSB_500 - offPitch_;
     out.gyroRollRate  = (float)gx / GYRO_LSB_500 - offRoll_;
+    out.gyroYawRate   = (float)gz / GYRO_LSB_500 - offYaw_;
+    out.rawAx = ax / ACCEL_LSB_4G;
+    out.rawAy = ay / ACCEL_LSB_4G;
+    out.rawAz = az / ACCEL_LSB_4G;
     return true;
   }
 
@@ -72,14 +78,15 @@ public:
    */
   void calibrate(int samples) {
     if (!ready_) return;
-    float sumPitch = 0.0f, sumRoll = 0.0f;
+    float sumPitch = 0.0f, sumRoll = 0.0f, sumYaw = 0.0f;
     int valid = 0;
-    offPitch_ = offRoll_ = 0.0f;  // 校準期間讀原始值
+    offPitch_ = offRoll_ = offYaw_ = 0.0f;  // 校準期間讀原始值
     for (int i = 0; i < samples; i++) {
       ImuSample s;
       if (read(s)) {
         sumPitch += s.gyroPitchRate;
         sumRoll  += s.gyroRollRate;
+        sumYaw   += s.gyroYawRate;
         valid++;
       }
       vTaskDelay(pdMS_TO_TICKS(5));
@@ -87,6 +94,7 @@ public:
     if (valid > 0) {
       offPitch_ = sumPitch / valid;
       offRoll_  = sumRoll / valid;
+      offYaw_   = sumYaw / valid;
     }
   }
 
@@ -102,6 +110,7 @@ private:
   bool ready_ = false;
   float offPitch_ = 0.0f;
   float offRoll_ = 0.0f;
+  float offYaw_ = 0.0f;
 };
 
 /** 單一肢段的 Pitch/Roll 互補濾波器 */

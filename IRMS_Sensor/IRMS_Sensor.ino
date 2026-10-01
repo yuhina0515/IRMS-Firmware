@@ -30,6 +30,8 @@ struct LegAngles {
   float thighRoll, shinRoll, kneeRoll;
   float thighX, thighY, thighZ;
   float shinX, shinY, shinZ;
+  float thighGyro[3], shinGyro[3];  // deg/s,感測器軸向(原始串流用)
+  float thighAcc[3], shinAcc[3];    // g,未正規化(原始串流用)
 };
 static LegAngles latestAngles = {};
 static SemaphoreHandle_t xAngleMutex;
@@ -72,6 +74,7 @@ static void otaReset() {
 // ── 回饋輸出旗標(由 BLE onWrite 設定,由對應執行緒消費)──
 volatile bool goalBeepRequest = false;  // 達標雙響請求(Task_LED 消費)
 volatile bool alarmActive = false;      // 超限警報狀態(雙響結束後據此恢復蜂鳴器)
+volatile bool rawStreamOn = false;      // CMD:RAW_ON 開啟的 G: 封包(預設關,斷線即關)
 
 // ── 感測物件 ──
 static Mpu6050 imuThigh(ADDR_THIGH);
@@ -85,6 +88,7 @@ static void feedbackAllOff() {
   digitalWrite(PIN_BUZZER, LOW);
   alarmActive = false;
   goalBeepRequest = false;
+  rawStreamOn = false;
 }
 
 class ServerCallbacks : public BLEServerCallbacks {
@@ -139,6 +143,10 @@ class ProfileCallbacks : public BLECharacteristicCallbacks {
     } else if (data == "CMD:ALARM_ON") {
       alarmActive = true;
       digitalWrite(PIN_BUZZER, HIGH);
+    } else if (data == "CMD:RAW_ON") {
+      rawStreamOn = true;
+    } else if (data == "CMD:RAW_OFF") {
+      rawStreamOn = false;
     } else if (data == "CMD:ALARM_OFF") {
       alarmActive = false;
       digitalWrite(PIN_BUZZER, LOW);
@@ -285,6 +293,10 @@ static void Task_Sensor(void *) {
       a.kneeRoll  = fabsf(a.thighRoll - a.shinRoll);
       a.thighX = s1.ax; a.thighY = s1.ay; a.thighZ = s1.az;
       a.shinX = s2.ax;  a.shinY = s2.ay;  a.shinZ = s2.az;
+      a.thighGyro[0] = s1.gyroRollRate; a.thighGyro[1] = s1.gyroPitchRate; a.thighGyro[2] = s1.gyroYawRate;
+      a.shinGyro[0]  = s2.gyroRollRate; a.shinGyro[1]  = s2.gyroPitchRate; a.shinGyro[2]  = s2.gyroYawRate;
+      a.thighAcc[0] = s1.rawAx; a.thighAcc[1] = s1.rawAy; a.thighAcc[2] = s1.rawAz;
+      a.shinAcc[0]  = s2.rawAx; a.shinAcc[1]  = s2.rawAy; a.shinAcc[2]  = s2.rawAz;
 
       if (xSemaphoreTake(xAngleMutex, portMAX_DELAY) == pdTRUE) {
         latestAngles = a;
@@ -320,6 +332,7 @@ static void Task_Sensor(void *) {
 // ─────────────────────────────────────────────────────────────
 static void Task_Comm(void *) {
   char buf[128];
+  char rawBuf[RAW_PACKET_MAX_BYTES];
   for (;;) {
     // 封包在「已連線」或「開了序列遙測」時才需要組。後者讓桌上旋轉記錄不必先有
     // App 連線就能擷取(issue #2)——原本 notify 與封包組裝綁在同一個 if 裡,
@@ -333,6 +346,18 @@ static void Task_Comm(void *) {
         if (xSemaphoreTake(xAngleMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           a = latestAngles;
           xSemaphoreGive(xAngleMutex);
+          if (rawStreamOn && deviceConnected) {
+            const int rawLen = snprintf(rawBuf, sizeof(rawBuf),
+                                        "G:%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.3f/%.3f/%.3f/%.3f/%.3f/%.3f",
+                                        a.thighGyro[0], a.thighGyro[1], a.thighGyro[2],
+                                        a.shinGyro[0], a.shinGyro[1], a.shinGyro[2],
+                                        a.thighAcc[0], a.thighAcc[1], a.thighAcc[2],
+                                        a.shinAcc[0], a.shinAcc[1], a.shinAcc[2]);
+            if (rawLen > 0 && rawLen < (int)sizeof(rawBuf)) {
+              pCharAngleTx->setValue((uint8_t *)rawBuf, rawLen);
+              pCharAngleTx->notify();
+            }
+          }
           len = snprintf(buf, sizeof(buf),
                          "T:%.1f,S:%.1f,K:%.1f,TR:%.1f,SR:%.1f,KR:%.1f,"
                          "V:%.3f/%.3f/%.3f/%.3f/%.3f/%.3f",
